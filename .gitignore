@@ -106,3 +106,6 @@ temp/
 .Trashes
 ehthumbs.db
 Thumbs.db
+
+# Conversation logs
+logs/

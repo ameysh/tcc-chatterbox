@@ -8,6 +8,26 @@ require('dotenv').config();
 // Initialize Ollama client
 const ollama = new Ollama({ host: 'http://localhost:11434' });
 
+// Conversation logging function
+function logConversation(username, userMessage, aiResponse) {
+    const timestamp = new Date().toISOString();
+    const logEntry = `[${timestamp}] ${username}: ${userMessage}\n[${timestamp}] Bot: ${aiResponse}\n---\n`;
+    
+    // Create logs directory if it doesn't exist
+    const logsDir = path.join(__dirname, 'logs');
+    if (!fs.existsSync(logsDir)) {
+        fs.mkdirSync(logsDir);
+    }
+    
+    // Create log file with current date
+    const today = new Date().toISOString().split('T')[0]; // YYYY-MM-DD format
+    const logFile = path.join(logsDir, `conversations-${today}.txt`);
+    
+    // Append to log file
+    fs.appendFileSync(logFile, logEntry, 'utf8');
+    console.log(`Conversation logged to: ${logFile}`);
+}
+
 // Create a new client instance
 const client = new Client({
     intents: [
@@ -119,11 +139,16 @@ client.on('aiRequest', async ({ interaction, userMessage, userId, username }) =>
         const aiResponse = response.message.content;
         
         // Discord has a 2000 character limit for messages
+        let finalResponse = aiResponse;
         if (aiResponse.length > 2000) {
-            await interaction.editReply(aiResponse.substring(0, 1997) + '...');
+            finalResponse = aiResponse.substring(0, 1997) + '...';
+            await interaction.editReply(finalResponse);
         } else {
             await interaction.editReply(aiResponse);
         }
+        
+        // Log the conversation
+        logConversation(username, userMessage, finalResponse);
         
         console.log(`AI response sent to ${username}`);
         
