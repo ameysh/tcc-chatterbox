@@ -28,6 +28,58 @@ function logConversation(username, userMessage, aiResponse) {
     console.log(`Conversation logged to: ${logFile}`);
 }
 
+// Shared function to process AI requests
+async function processAIRequest(messageOrInteraction, userMessage, username, isSlashCommand = false) {
+    try {
+        console.log(`AI request from ${username}: ${userMessage}`);
+        
+        // Generate response using Ollama
+        const response = await ollama.chat({
+            model: process.env.OLLAMA_MODEL || 'llama3.2',
+            messages: [
+                {
+                    role: 'system',
+                    content: process.env.OLLAMA_SYSTEM_PROMPT || 'You are a helpful assistant.'
+                },
+                {
+                    role: 'user',
+                    content: userMessage
+                }
+            ],
+        });
+
+        const aiResponse = response.message.content;
+        
+        // Handle Discord's 2000 character limit
+        let finalResponse = aiResponse;
+        if (aiResponse.length > 2000) {
+            finalResponse = aiResponse.substring(0, 1997) + '...';
+        }
+        
+        // Send response based on type (slash command or regular message)
+        if (isSlashCommand) {
+            await messageOrInteraction.editReply(finalResponse);
+        } else {
+            await messageOrInteraction.reply(finalResponse);
+        }
+        
+        // Log the conversation
+        logConversation(username, userMessage, finalResponse);
+        
+        console.log(`AI response sent to ${username}`);
+        
+    } catch (error) {
+        console.error('Error generating AI response:', error);
+        const errorMessage = 'Sorry, I encountered an error while generating a response. Please try again later.';
+        
+        if (isSlashCommand) {
+            await messageOrInteraction.editReply(errorMessage);
+        } else {
+            await messageOrInteraction.reply(errorMessage);
+        }
+    }
+}
+
 // Create a new client instance
 const client = new Client({
     intents: [
@@ -74,7 +126,7 @@ client.once(Events.ClientReady, readyClient => {
 });
 
 // Listen for messages
-client.on(Events.MessageCreate, message => {
+client.on(Events.MessageCreate, async message => {
     // Ignore messages from bots (including this bot)
     if (message.author.bot) return;
     
@@ -87,8 +139,23 @@ client.on(Events.MessageCreate, message => {
     // Log incoming messages for debugging
     console.log(`Message from ${message.author.username}: ${message.content}`);
 
-    // Can add custom message commands here
-
+    // Check if this message is a reply to the bot
+    if (message.reference && message.reference.messageId) {
+        try {
+            const repliedMessage = await message.channel.messages.fetch(message.reference.messageId);
+            
+            // If the reply is to the bot, continue the conversation
+            if (repliedMessage.author.id === client.user.id) {
+                console.log(`Reply to bot from ${message.author.username}: ${message.content}`);
+                
+                // Process the reply through Ollama
+                await processAIRequest(message, message.content, message.author.username);
+                return;
+            }
+        } catch (error) {
+            console.error('Error fetching replied message:', error);
+        }
+    }
 });
 
 // Handle slash command interactions
@@ -118,44 +185,7 @@ client.on(Events.InteractionCreate, async interaction => {
 
 // Handle AI requests from the /talk command
 client.on('aiRequest', async ({ interaction, userMessage, userId, username }) => {
-    try {
-        console.log(`AI request from ${username}: ${userMessage}`);
-        
-        // Generate response using Ollama
-        const response = await ollama.chat({
-            model: process.env.OLLAMA_MODEL || 'llama3.2',
-            messages: [
-                {
-                    role: 'system',
-                    content: process.env.OLLAMA_SYSTEM_PROMPT || 'You are a helpful assistant.'
-                },
-                {
-                    role: 'user',
-                    content: userMessage
-                }
-            ],
-        });
-
-        const aiResponse = response.message.content;
-        
-        // Discord has a 2000 character limit for messages
-        let finalResponse = aiResponse;
-        if (aiResponse.length > 2000) {
-            finalResponse = aiResponse.substring(0, 1997) + '...';
-            await interaction.editReply(finalResponse);
-        } else {
-            await interaction.editReply(aiResponse);
-        }
-        
-        // Log the conversation
-        logConversation(username, userMessage, finalResponse);
-        
-        console.log(`AI response sent to ${username}`);
-        
-    } catch (error) {
-        console.error('Error generating AI response:', error);
-        await interaction.editReply('Sorry, I encountered an error while generating a response. Please try again later.');
-    }
+    await processAIRequest(interaction, userMessage, username, true);
 });
 
 // Error handling
