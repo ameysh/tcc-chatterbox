@@ -8,40 +8,47 @@ require('dotenv').config();
 // Initialize Ollama client
 const ollama = new Ollama({ host: 'http://localhost:11434' });
 
-// Conversation memory storage (userId -> conversation history)
+// Conversation memory storage (threadId -> conversation history)
+// threadId is channelId for /talk commands, or original messageId for reply threads
 const conversationHistory = new Map();
 
-// Function to get or create conversation history for a user
-function getUserConversation(userId) {
-    if (!conversationHistory.has(userId)) {
-        conversationHistory.set(userId, [
+// Mapping from message IDs to their thread IDs (to handle reply chains)
+const messageToThreadMap = new Map();
+
+// Function to get or create conversation history for a thread
+function getThreadConversation(threadId) {
+    if (!conversationHistory.has(threadId)) {
+        conversationHistory.set(threadId, [
             {
                 role: 'system',
                 content: process.env.OLLAMA_SYSTEM_PROMPT || 'You are a helpful assistant.'
             }
         ]);
     }
-    return conversationHistory.get(userId);
+    return conversationHistory.get(threadId);
 }
 
-// Function to add message to user's conversation history
-function addToConversation(userId, role, content) {
-    const conversation = getUserConversation(userId);
-    conversation.push({ role, content });
+// Function to add message to thread's conversation history
+function addToConversation(threadId, role, content, username = null) {
+    const conversation = getThreadConversation(threadId);
+    
+    // Add username context for user messages to help AI track speakers
+    const messageContent = username && role === 'user' ? `${username}: ${content}` : content;
+    conversation.push({ role, content: messageContent });
     
     // Keep conversation history manageable (last 20 messages + system prompt)
     if (conversation.length > 21) {
         // Keep system prompt (first message) and last 20 messages
         const systemPrompt = conversation[0];
         const recentMessages = conversation.slice(-20);
-        conversationHistory.set(userId, [systemPrompt, ...recentMessages]);
+        conversationHistory.set(threadId, [systemPrompt, ...recentMessages]);
     }
 }
 
-// Function to clear a user's conversation history
-function clearUserConversation(userId) {
-    conversationHistory.delete(userId);
-    console.log(`Cleared conversation history for user ${userId}`);
+// Function to clear a thread's conversation history
+function clearThreadConversation(threadId) {
+    conversationHistory.delete(threadId);
+    console.log(`Cleared conversation history for thread ${threadId}`);
 }
 
 // Conversation logging function
@@ -69,22 +76,88 @@ async function processAIRequest(messageOrInteraction, userMessage, username, use
     try {
         console.log(`AI request from ${username}: ${userMessage}`);
         
-        // Get user's conversation history
-        const conversation = getUserConversation(userId);
+        // Determine thread ID for conversation context
+        let threadId;
+        if (isSlashCommand) {
+            // For /talk commands, use channel ID as thread ID
+            threadId = messageOrInteraction.channelId;
+        } else {
+            // For replies, find the original thread starter
+            if (messageOrInteraction.reference && messageOrInteraction.reference.messageId) {
+                const referencedMessageId = messageOrInteraction.reference.messageId;
+                
+                // First check if there's a direct mapping from the referenced message
+                if (messageToThreadMap.has(referencedMessageId)) {
+                    threadId = messageToThreadMap.get(referencedMessageId);
+                    console.log(`Found thread mapping: message ${referencedMessageId} -> thread ${threadId}`);
+                } else {
+                    // Fallback: trace back through the conversation chain
+                    let rootMessageId = referencedMessageId;
+                    
+                    try {
+                        let currentMessageId = rootMessageId;
+                        let depth = 0;
+                        const maxDepth = 20; // Prevent infinite loops
+                        
+                        while (depth < maxDepth) {
+                            // Check if there's a mapping for this message
+                            if (messageToThreadMap.has(currentMessageId)) {
+                                threadId = messageToThreadMap.get(currentMessageId);
+                                console.log(`Found thread mapping during trace: message ${currentMessageId} -> thread ${threadId}`);
+                                break;
+                            }
+                            
+                            const referencedMessage = await messageOrInteraction.channel.messages.fetch(currentMessageId);
+                            
+                            // If this message is also a reply, continue tracing back
+                            if (referencedMessage.reference && referencedMessage.reference.messageId) {
+                                rootMessageId = referencedMessage.reference.messageId;
+                                currentMessageId = referencedMessage.reference.messageId;
+                                depth++;
+                            } else {
+                                // Found the root message (no more references)
+                                rootMessageId = currentMessageId;
+                                break;
+                            }
+                        }
+                        
+                        if (!threadId) {
+                            threadId = rootMessageId;
+                            console.log(`Traced thread back to root message: ${rootMessageId}`);
+                        }
+                    } catch (error) {
+                        console.log('Could not trace thread root, using referenced message ID');
+                        threadId = referencedMessageId;
+                    }
+                }
+            } else {
+                // Fallback to channel ID if no reference
+                threadId = messageOrInteraction.channelId;
+            }
+        }
         
-        // Add user's message to conversation history
-        addToConversation(userId, 'user', userMessage);
+        console.log(`Using thread ID: ${threadId}`);
+        
+        // Get thread's conversation history
+        const conversation = getThreadConversation(threadId);
+        console.log(`Thread has ${conversation.length - 1} previous messages`);
+        
+        // Add user's message to conversation history with username
+        addToConversation(threadId, 'user', userMessage, username);
         
         // Generate response using Ollama with full conversation context
         const response = await ollama.chat({
             model: process.env.OLLAMA_MODEL || 'llama3.2',
-            messages: conversation.concat([{ role: 'user', content: userMessage }]),
+            messages: conversation.concat([{ 
+                role: 'user', 
+                content: `${username}: ${userMessage}` 
+            }]),
         });
 
         const aiResponse = response.message.content;
         
         // Add AI's response to conversation history
-        addToConversation(userId, 'assistant', aiResponse);
+        addToConversation(threadId, 'assistant', aiResponse);
         
         // Handle Discord's 2000 character limit
         let finalResponse = aiResponse;
@@ -93,11 +166,18 @@ async function processAIRequest(messageOrInteraction, userMessage, username, use
         }
         
         // Send response based on type (slash command or regular message)
+        let botResponseMessage;
         if (isSlashCommand) {
             await messageOrInteraction.editReply(finalResponse);
+            // For slash commands, fetching the response message is necessary
+            botResponseMessage = await messageOrInteraction.fetchReply();
         } else {
-            await messageOrInteraction.reply(finalResponse);
+            botResponseMessage = await messageOrInteraction.reply(finalResponse);
         }
+        
+        // Map the bot's response message to this thread for future replies
+        messageToThreadMap.set(botResponseMessage.id, threadId);
+        console.log(`Mapped bot message ${botResponseMessage.id} to thread ${threadId}`);
         
         // Log the conversation
         logConversation(username, userMessage, finalResponse);
@@ -292,7 +372,7 @@ function setupManualInput(client) {
                     console.log('\nManual Message Commands:');
                     console.log('- send <channel_id> <message> - Send a message to a specific channel');
                     console.log('- list - Show all available channels with their IDs');
-                    console.log('- clear <user_id> - Clear conversation history for a user');
+                    console.log('- clear <thread_id> - Clear conversation history for a thread');
                     console.log('- clearall - Clear all conversation histories');
                     console.log('- help - Show this help message');
                     console.log('- exit - Close the bot\n');
@@ -300,12 +380,12 @@ function setupManualInput(client) {
 
                 case 'clear':
                     if (args.length < 2) {
-                        console.log('Usage: clear <user_id>');
+                        console.log('Usage: clear <thread_id> (can be channel_id or message_id)');
                         break;
                     }
-                    const userId = args[1];
-                    clearUserConversation(userId);
-                    console.log(`Cleared conversation history for user ${userId}`);
+                    const threadId = args[1];
+                    clearThreadConversation(threadId);
+                    console.log(`Cleared conversation history for thread ${threadId}`);
                     break;
 
                 case 'clearall':
