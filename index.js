@@ -8,6 +8,42 @@ require('dotenv').config();
 // Initialize Ollama client
 const ollama = new Ollama({ host: 'http://localhost:11434' });
 
+// Conversation memory storage (userId -> conversation history)
+const conversationHistory = new Map();
+
+// Function to get or create conversation history for a user
+function getUserConversation(userId) {
+    if (!conversationHistory.has(userId)) {
+        conversationHistory.set(userId, [
+            {
+                role: 'system',
+                content: process.env.OLLAMA_SYSTEM_PROMPT || 'You are a helpful assistant.'
+            }
+        ]);
+    }
+    return conversationHistory.get(userId);
+}
+
+// Function to add message to user's conversation history
+function addToConversation(userId, role, content) {
+    const conversation = getUserConversation(userId);
+    conversation.push({ role, content });
+    
+    // Keep conversation history manageable (last 20 messages + system prompt)
+    if (conversation.length > 21) {
+        // Keep system prompt (first message) and last 20 messages
+        const systemPrompt = conversation[0];
+        const recentMessages = conversation.slice(-20);
+        conversationHistory.set(userId, [systemPrompt, ...recentMessages]);
+    }
+}
+
+// Function to clear a user's conversation history
+function clearUserConversation(userId) {
+    conversationHistory.delete(userId);
+    console.log(`Cleared conversation history for user ${userId}`);
+}
+
 // Conversation logging function
 function logConversation(username, userMessage, aiResponse) {
     const timestamp = new Date().toISOString();
@@ -29,26 +65,26 @@ function logConversation(username, userMessage, aiResponse) {
 }
 
 // Shared function to process AI requests
-async function processAIRequest(messageOrInteraction, userMessage, username, isSlashCommand = false) {
+async function processAIRequest(messageOrInteraction, userMessage, username, userId, isSlashCommand = false) {
     try {
         console.log(`AI request from ${username}: ${userMessage}`);
         
-        // Generate response using Ollama
+        // Get user's conversation history
+        const conversation = getUserConversation(userId);
+        
+        // Add user's message to conversation history
+        addToConversation(userId, 'user', userMessage);
+        
+        // Generate response using Ollama with full conversation context
         const response = await ollama.chat({
             model: process.env.OLLAMA_MODEL || 'llama3.2',
-            messages: [
-                {
-                    role: 'system',
-                    content: process.env.OLLAMA_SYSTEM_PROMPT || 'You are a helpful assistant.'
-                },
-                {
-                    role: 'user',
-                    content: userMessage
-                }
-            ],
+            messages: conversation.concat([{ role: 'user', content: userMessage }]),
         });
 
         const aiResponse = response.message.content;
+        
+        // Add AI's response to conversation history
+        addToConversation(userId, 'assistant', aiResponse);
         
         // Handle Discord's 2000 character limit
         let finalResponse = aiResponse;
@@ -116,9 +152,9 @@ client.once(Events.ClientReady, readyClient => {
     console.log('Bot is online and ready!');
     console.log('---');
     console.log('Manual Message Commands:');
-    console.log('• Type "send <channel_id> <message>" to send a message to a specific channel');
-    console.log('• Type "list" to see available channels');
-    console.log('• Type "help" to see these commands again');
+    console.log('- Type "send <channel_id> <message>" to send a message to a specific channel');
+    console.log('- Type "list" to see available channels');
+    console.log('- Type "help" to see these commands again');
     console.log('---');
     
     // Set up readline interface for manual input
@@ -149,7 +185,7 @@ client.on(Events.MessageCreate, async message => {
                 console.log(`Reply to bot from ${message.author.username}: ${message.content}`);
                 
                 // Process the reply through Ollama
-                await processAIRequest(message, message.content, message.author.username);
+                await processAIRequest(message, message.content, message.author.username, message.author.id);
                 return;
             }
         } catch (error) {
@@ -185,7 +221,7 @@ client.on(Events.InteractionCreate, async interaction => {
 
 // Handle AI requests from the /talk command
 client.on('aiRequest', async ({ interaction, userMessage, userId, username }) => {
-    await processAIRequest(interaction, userMessage, username, true);
+    await processAIRequest(interaction, userMessage, username, userId, true);
 });
 
 // Error handling
@@ -228,28 +264,45 @@ function setupManualInput(client) {
                     break;
 
                 case 'list':
-                    console.log('\n📋 Available Channels:');
+                    console.log('\nAvailable Channels:');
                     client.guilds.cache.forEach(guild => {
-                        console.log(`\n🏠 ${guild.name}:`);
+                        console.log(`\n${guild.name}:`);
                         guild.channels.cache
                             .filter(ch => ch.type === 0) // Text channels only
                             .forEach(channel => {
-                                console.log(`  • #${channel.name} (ID: ${channel.id})`);
+                                console.log(`  - #${channel.name} (ID: ${channel.id})`);
                             });
                     });
                     console.log('');
                     break;
 
                 case 'help':
-                    console.log('\n📖 Manual Message Commands:');
-                    console.log('• send <channel_id> <message> - Send a message to a specific channel');
-                    console.log('• list - Show all available channels with their IDs');
-                    console.log('• help - Show this help message');
-                    console.log('• exit - Close the bot\n');
+                    console.log('\nManual Message Commands:');
+                    console.log('- send <channel_id> <message> - Send a message to a specific channel');
+                    console.log('- list - Show all available channels with their IDs');
+                    console.log('- clear <user_id> - Clear conversation history for a user');
+                    console.log('- clearall - Clear all conversation histories');
+                    console.log('- help - Show this help message');
+                    console.log('- exit - Close the bot\n');
+                    break;
+
+                case 'clear':
+                    if (args.length < 2) {
+                        console.log('Usage: clear <user_id>');
+                        break;
+                    }
+                    const userId = args[1];
+                    clearUserConversation(userId);
+                    console.log(`Cleared conversation history for user ${userId}`);
+                    break;
+
+                case 'clearall':
+                    conversationHistory.clear();
+                    console.log('Cleared all conversation histories');
                     break;
 
                 case 'exit':
-                    console.log('👋 Shutting down bot...');
+                    console.log('Shutting down bot...');
                     await client.destroy();
                     rl.close();
                     process.exit(0);
@@ -269,7 +322,7 @@ function setupManualInput(client) {
     });
 
     rl.on('close', () => {
-        console.log('\n👋 Goodbye!');
+        console.log('\nGoodbye!');
         process.exit(0);
     });
 }
