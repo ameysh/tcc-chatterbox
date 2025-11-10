@@ -1,6 +1,12 @@
-const { Client, GatewayIntentBits, Events } = require('discord.js');
+const { Client, GatewayIntentBits, Events, Collection } = require('discord.js');
+const { Ollama } = require('ollama');
 const readline = require('readline');
+const fs = require('fs');
+const path = require('path');
 require('dotenv').config();
+
+// Initialize Ollama client
+const ollama = new Ollama({ host: 'http://localhost:11434' });
 
 // Create a new client instance
 const client = new Client({
@@ -10,6 +16,27 @@ const client = new Client({
         GatewayIntentBits.MessageContent
     ]
 });
+
+// Commands collection
+client.commands = new Collection();
+
+// Load commands
+const commandsPath = path.join(__dirname, 'commands');
+if (fs.existsSync(commandsPath)) {
+    const commandFiles = fs.readdirSync(commandsPath).filter(file => file.endsWith('.js'));
+    
+    for (const file of commandFiles) {
+        const filePath = path.join(commandsPath, file);
+        const command = require(filePath);
+        
+        if ('data' in command && 'execute' in command) {
+            client.commands.set(command.data.name, command);
+            console.log(`Loaded command: ${command.data.name}`);
+        } else {
+            console.log(`Warning: Command at ${filePath} is missing required "data" or "execute" property.`);
+        }
+    }
+}
 
 // When the client is ready, run this code (only once)
 client.once(Events.ClientReady, readyClient => {
@@ -42,6 +69,68 @@ client.on(Events.MessageCreate, message => {
 
     // Can add custom message commands here
 
+});
+
+// Handle slash command interactions
+client.on(Events.InteractionCreate, async interaction => {
+    if (!interaction.isChatInputCommand()) return;
+
+    const command = interaction.client.commands.get(interaction.commandName);
+
+    if (!command) {
+        console.error(`No command matching ${interaction.commandName} was found.`);
+        return;
+    }
+
+    try {
+        await command.execute(interaction);
+    } catch (error) {
+        console.error('Error executing command:', error);
+        const errorMessage = 'There was an error while executing this command!';
+        
+        if (interaction.replied || interaction.deferred) {
+            await interaction.followUp({ content: errorMessage, ephemeral: true });
+        } else {
+            await interaction.reply({ content: errorMessage, ephemeral: true });
+        }
+    }
+});
+
+// Handle AI requests from the /talk command
+client.on('aiRequest', async ({ interaction, userMessage, userId, username }) => {
+    try {
+        console.log(`AI request from ${username}: ${userMessage}`);
+        
+        // Generate response using Ollama
+        const response = await ollama.chat({
+            model: process.env.OLLAMA_MODEL || 'llama3.2',
+            messages: [
+                {
+                    role: 'system',
+                    content: process.env.OLLAMA_SYSTEM_PROMPT || 'You are a helpful assistant.'
+                },
+                {
+                    role: 'user',
+                    content: userMessage
+                }
+            ],
+        });
+
+        const aiResponse = response.message.content;
+        
+        // Discord has a 2000 character limit for messages
+        if (aiResponse.length > 2000) {
+            await interaction.editReply(aiResponse.substring(0, 1997) + '...');
+        } else {
+            await interaction.editReply(aiResponse);
+        }
+        
+        console.log(`AI response sent to ${username}`);
+        
+    } catch (error) {
+        console.error('Error generating AI response:', error);
+        await interaction.editReply('Sorry, I encountered an error while generating a response. Please try again later.');
+    }
 });
 
 // Error handling
