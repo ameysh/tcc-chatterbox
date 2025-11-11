@@ -15,6 +15,9 @@ const conversationHistory = new Map();
 // Mapping from message IDs to their thread IDs (to handle reply chains)
 const messageToThreadMap = new Map();
 
+// Recent processed message IDs to avoid duplicate handling of the same message
+const processedMessageIds = new Set();
+
 // Function to get or create conversation history for a thread
 function getThreadConversation(threadId) {
     if (!conversationHistory.has(threadId)) {
@@ -299,6 +302,16 @@ client.on(Events.MessageCreate, async message => {
 
     // Log incoming messages for debugging
     console.log(`Message from ${message.author.username}: ${message.content}`);
+
+    // Deduplicate: ignore duplicate MessageCreate events for the same message ID
+    // (some environments / sharding setups may occasionally emit duplicate events)
+    if (processedMessageIds.has(message.id)) {
+        console.log(`Ignoring duplicate MessageCreate for message ${message.id}`);
+        return;
+    }
+    // Remember this message for a short window to avoid double-processing
+    processedMessageIds.add(message.id);
+    setTimeout(() => processedMessageIds.delete(message.id), 30 * 1000); // keep for 30s
 
     // Check if this message is a reply to the bot
     if (message.reference && message.reference.messageId) {
