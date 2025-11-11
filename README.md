@@ -9,6 +9,8 @@ This is a **private Discord bot** created for personal use within our closed Dis
 ## Features
 
 - **AI-Powered Responses**: Integrated with Ollama for AI-powered chat responses
+- **Image Support**: The bot can perceive images, as long as the model supports it
 - **Configurable AI Model**: Model and system prompt configurable via environment variables
 - **Manual Message Broadcasting**: Send messages as the bot through terminal commands
 - **Slash Commands**: Modern Discord slash command support
+

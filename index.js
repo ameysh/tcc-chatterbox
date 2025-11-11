@@ -21,7 +21,7 @@ function getThreadConversation(threadId) {
         conversationHistory.set(threadId, [
             {
                 role: 'system',
-                content: process.env.OLLAMA_SYSTEM_PROMPT || 'You are a helpful assistant.'
+                content: process.env.OLLAMA_SYSTEM_PROMPT || 'You are a helpful assistant with image understanding capabilities.'
             }
         ]);
     }
@@ -52,9 +52,13 @@ function clearThreadConversation(threadId) {
 }
 
 // Conversation logging function
-function logConversation(username, userMessage, aiResponse) {
+function logConversation(username, userMessage, aiResponse, images = []) {
     const timestamp = new Date().toISOString();
-    const logEntry = `[${timestamp}] ${username}: ${userMessage}\n[${timestamp}] Bot: ${aiResponse}\n---\n`;
+    let logEntry = `[${timestamp}] ${username}: ${userMessage}`;
+    if (images && images.length > 0) {
+        logEntry += `\nImages: ${images.join(', ')}`;
+    }
+    logEntry += `\n[${timestamp}] Bot: ${aiResponse}\n---\n`;
     
     // Create logs directory if it doesn't exist
     const logsDir = path.join(__dirname, 'logs');
@@ -72,9 +76,29 @@ function logConversation(username, userMessage, aiResponse) {
 }
 
 // Shared function to process AI requests
-async function processAIRequest(messageOrInteraction, userMessage, username, userId, isSlashCommand = false) {
+async function processAIRequest(messageOrInteraction, userMessage, username, userId, isSlashCommand = false, attachments = []) {
     try {
         console.log(`AI request from ${username}: ${userMessage}`);
+        // Collect image URLs from attachments (slash command or message)
+        let imageUrls = [];
+        try {
+            if (isSlashCommand) {
+                // attachments prop may be provided by the caller
+                if (attachments && attachments.length) {
+                    imageUrls = attachments.slice();
+                } else if (messageOrInteraction.options && messageOrInteraction.options.getAttachment) {
+                    const att = messageOrInteraction.options.getAttachment('image');
+                    if (att) imageUrls.push(att.url);
+                }
+            } else {
+                // message object: collect attachments from the message
+                if (messageOrInteraction.attachments && messageOrInteraction.attachments.size > 0) {
+                    imageUrls = imageUrls.concat(Array.from(messageOrInteraction.attachments.values()).map(a => a.url));
+                }
+            }
+        } catch (err) {
+            console.log('Error collecting attachments:', err?.message || err);
+        }
         
         // Determine thread ID for conversation context
         let threadId;
@@ -147,15 +171,21 @@ async function processAIRequest(messageOrInteraction, userMessage, username, use
             role: 'user', 
             content: `${username}: ${userMessage}` 
         };
-        
+
+        // If there are images, add an explicit user message listing image URLs so the model can fetch/interpret them
+        const messagesForModel = conversation.concat([currentMessage]);
+        if (imageUrls && imageUrls.length > 0) {
+            messagesForModel.push({ role: 'user', content: `Image URLs: ${imageUrls.join(' ')}` });
+        }
+
         // Generate response using Ollama with full conversation context
         const response = await ollama.chat({
             model: process.env.OLLAMA_MODEL || 'llama3.2',
-            messages: conversation.concat([currentMessage]),
+            messages: messagesForModel,
         });
-        
+
         // Add user's message to conversation history AFTER getting AI response
-        addToConversation(threadId, 'user', userMessage, username);
+        addToConversation(threadId, 'user', userMessage + (imageUrls && imageUrls.length ? ` [Images: ${imageUrls.join(', ')}]` : ''), username);
 
         const aiResponse = response.message.content;
         
@@ -182,8 +212,8 @@ async function processAIRequest(messageOrInteraction, userMessage, username, use
         messageToThreadMap.set(botResponseMessage.id, threadId);
         console.log(`Mapped bot message ${botResponseMessage.id} to thread ${threadId}`);
         
-        // Log the conversation
-        logConversation(username, userMessage, finalResponse);
+    // Log the conversation (include any image URLs collected earlier)
+    logConversation(username, userMessage, finalResponse, imageUrls || []);
         
         console.log(`AI response sent to ${username}`);
         
@@ -278,9 +308,14 @@ client.on(Events.MessageCreate, async message => {
             // If the reply is to the bot, continue the conversation
             if (repliedMessage.author.id === client.user.id) {
                 console.log(`Reply to bot from ${message.author.username}: ${message.content}`);
-                
-                // Process the reply through Ollama
-                await processAIRequest(message, message.content, message.author.username, message.author.id);
+
+                // Collect attachment URLs (if any)
+                const attachments = (message.attachments && message.attachments.size > 0)
+                    ? Array.from(message.attachments.values()).map(a => a.url)
+                    : [];
+
+                // Process the reply through Ollama (pass attachments)
+                await processAIRequest(message, message.content, message.author.username, message.author.id, false, attachments);
                 return;
             }
         } catch (error) {
@@ -315,8 +350,8 @@ client.on(Events.InteractionCreate, async interaction => {
 });
 
 // Handle AI requests from the /talk command
-client.on('aiRequest', async ({ interaction, userMessage, userId, username }) => {
-    await processAIRequest(interaction, userMessage, username, userId, true);
+client.on('aiRequest', async ({ interaction, userMessage, userId, username, attachments }) => {
+    await processAIRequest(interaction, userMessage, username, userId, true, attachments || []);
 });
 
 // Error handling
